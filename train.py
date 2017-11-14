@@ -1,179 +1,257 @@
-import argparse
+import time
 import os
+import numpy as np
 import random
 
-from torch import utils
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-import numpy as np
 import torch
 import torch.nn as nn
+from torchtext import data
 
-import data
-import model
+from args import get_args
+from model import SmConvRNN
+from trec_dataset import TrecDataset
+import operator
+import heapq
+from torch.nn import functional as F
 
-class RandomSearch(object):
-    def __init__(self, params):
-        self.params = params
+from evaluate import evaluate
 
-    def __iter__(self):
-        param_space = list(GridSearch(self.params))
-        random.shuffle(param_space)
-        for param in param_space:
-            yield param
+args = get_args()
+config = args
+torch.manual_seed(args.seed)
+torch.backends.cudnn.deterministic = True
 
-class GridSearch(object):
-    def __init__(self, params):
-        self.params = params
-        self.param_lengths = [len(param) for param in self.params]
-        self.indices = [1] * len(params)
+def set_vectors(field, vector_path):
+    if os.path.isfile(vector_path):
+        stoi, vectors, dim = torch.load(vector_path)
+        field.vocab.vectors = torch.Tensor(len(field.vocab), dim)
 
-    def _update(self, carry_idx):
-        if carry_idx >= len(self.params):
-            return True
-        if self.indices[carry_idx] < self.param_lengths[carry_idx]:
-            self.indices[carry_idx] += 1
-            return False
-        else:
-            self.indices[carry_idx] = 1
-            return False or self._update(carry_idx + 1)
-
-    def __iter__(self):
-        self.stop_next = False
-        self.indices = [1] * len(self.params)
-        return self
-
-    def __next__(self):
-        if self.stop_next:
-            raise StopIteration
-        result = [param[idx - 1] for param, idx in zip(self.params, self.indices)]
-        self.indices[0] += 1
-        if self.indices[0] == self.param_lengths[0] + 1:
-            self.indices[0] = 1
-            self.stop_next = self._update(1)
-        return result
-
-def train(**kwargs):
-    mbatch_size = kwargs["mbatch_size"]
-    n_epochs = kwargs["n_epochs"]
-    restore = kwargs["restore"]
-    verbose = not kwargs["quiet"]
-    lr = kwargs["lr"]
-    weight_decay = kwargs["weight_decay"]
-    seed = kwargs["seed"]
-
-    if not kwargs["no_cuda"]:
-        torch.cuda.set_device(kwargs["gpu_number"])
-    model.set_seed(seed)
-    embed_loader = data.SSTEmbeddingLoader("data")
-    if restore:
-        conv_rnn = torch.load(kwargs["input_file"])
+        for i, token in enumerate(field.vocab.itos):
+            wv_index = stoi.get(token, None)
+            if wv_index is not None:
+                field.vocab.vectors[i] = vectors[wv_index]
+            else:
+                # initialize <unk> with U(-0.25, 0.25) vectors
+                field.vocab.vectors[i] = torch.FloatTensor(dim).uniform_(-0.25, 0.25)
     else:
-        id_dict, weights, unk_vocab_list = embed_loader.load_embed_data()
-        word_model = model.SSTWordEmbeddingModel(id_dict, weights, unk_vocab_list)
-        if not kwargs["no_cuda"]:
-            word_model.cuda()
-        conv_rnn = model.ConvRNNModel(word_model, **kwargs)
-        if not kwargs["no_cuda"]:
-            conv_rnn.cuda()
+        print("Error: Need word embedding pt file")
+        print("Error: Need word embedding pt file")
+        exit(1)
+    return field
 
-    conv_rnn.train()
-    criterion = nn.CrossEntropyLoss()
-    parameters = list(filter(lambda p: p.requires_grad, conv_rnn.parameters()))
-    optimizer = torch.optim.SGD(parameters, lr=lr, weight_decay=weight_decay, momentum=0.9)
-    scheduler = ReduceLROnPlateau(optimizer, patience=kwargs["dev_per_epoch"] * 4)
-    train_set, dev_set, test_set = data.SSTDataset.load_sst_sets("data")
 
-    collate_fn = conv_rnn.convert_dataset
-    train_loader = utils.data.DataLoader(train_set, shuffle=True, batch_size=mbatch_size, drop_last=True, 
-        collate_fn=collate_fn)
-    dev_loader = utils.data.DataLoader(dev_set, batch_size=len(dev_set), collate_fn=collate_fn)
-    test_loader = utils.data.DataLoader(test_set, batch_size=len(test_set), collate_fn=collate_fn)
+# Set random seed for reproducibility
+torch.manual_seed(args.seed)
+if not args.cuda:
+    args.gpu = -1
+if torch.cuda.is_available() and args.cuda:
+    print("Note: You are using GPU for training")
+    torch.cuda.set_device(args.gpu)
+    torch.cuda.manual_seed(args.seed)
+if torch.cuda.is_available() and not args.cuda:
+    print("You have Cuda but you're using CPU for training.")
+np.random.seed(args.seed)
+random.seed(args.seed)
 
-    def evaluate(loader, dev=True):
-        conv_rnn.eval()
-        for m_in, m_out in loader:
-            scores = conv_rnn(m_in)
-            loss = criterion(scores, m_out).cpu().data[0]
-            n_correct = (torch.max(scores, 1)[1].view(m_in.size(0)).data == m_out.data).sum()
-            accuracy = n_correct / m_in.size(0)
-            scheduler.step(accuracy)
-            if dev and accuracy >= evaluate.best_dev:
-                evaluate.best_dev = accuracy
-                print("Saving best model ({})...".format(accuracy))
-                torch.save(conv_rnn, kwargs["output_file"])
-            if verbose:
-                print("{} set accuracy: {}, loss: {}".format("dev" if dev else "test", accuracy, loss))
-        conv_rnn.train()
-    evaluate.best_dev = 0
+QID = data.Field(sequential=False)
+AID = data.Field(sequential=False)
+QUESTION = data.Field(batch_first=True)
+ANSWER = data.Field(batch_first=True)
+LABEL = data.Field(sequential=False)
+EXTERNAL = data.Field(sequential=True, tensor_type=torch.FloatTensor, batch_first=True, use_vocab=False,
+            postprocessing=data.Pipeline(lambda arr, _, train: [float(y) for y in arr]))
 
-    for epoch in range(n_epochs):
-        print("Epoch number: {}".format(epoch), end="\r")
-        if verbose:
-            print()
-        i = 0
-        for j, (train_in, train_out) in enumerate(train_loader):
-            optimizer.zero_grad()
+train, dev, test = TrecDataset.splits(QID, QUESTION, AID, ANSWER, EXTERNAL, LABEL)
 
-            if not kwargs["no_cuda"]:
-                train_in.cuda()
-                train_out.cuda()
+QID.build_vocab(train, dev, test)
+AID.build_vocab(train, dev, test)
+QUESTION.build_vocab(train, dev, test)
+ANSWER.build_vocab(train, dev, test)
+LABEL.build_vocab(train, dev, test)
 
-            scores = conv_rnn(train_in)
-            loss = criterion(scores, train_out)
-            loss.backward()
-            optimizer.step()
-            accuracy = (torch.max(scores, 1)[1].view(-1).data == train_out.data).sum() / mbatch_size
-            if verbose and i % (mbatch_size * 10) == 0:
-                print("accuracy: {}, {} / {}".format(accuracy, j * mbatch_size, len(train_set)))
-            i += mbatch_size
-            if i % (len(train_set) // kwargs["dev_per_epoch"]) < mbatch_size:
-                evaluate(dev_loader)
-    evaluate(test_loader, dev=False)
-    return evaluate.best_dev
+QUESTION = set_vectors(QUESTION, args.vector_cache)
+ANSWER = set_vectors(ANSWER, args.vector_cache)
 
-def do_random_search(given_params):
-    test_grid = [[0.15, 0.2], [4, 5, 6], [150, 200], [3, 4, 5], [200, 300], [200, 250]]
-    max_params = None
-    max_acc = 0.
-    for args in RandomSearch(test_grid):
-        sf, gc, hid, seed, fc_size, fmaps = args
-        print("Testing {}".format(args))
-        given_params.update(dict(n_epochs=7, quiet=True, gradient_clip=gc, hidden_Size=hid, seed=seed, 
-            n_feature_maps=fmaps, fc_size=fc_size))
-        dev_acc = train(**given_params)
-        print("Dev accuracy: {}".format(dev_acc))
-        if dev_acc > max_acc:
-            print("Found current max")
-            max_acc = dev_acc
-            max_params = args
-    print("Best params: {}".format(max_params))
+train_iter = data.Iterator(train, batch_size=args.batch_size, device=args.gpu, train=True, repeat=False,
+                           sort=False, shuffle=False)
+dev_iter = data.Iterator(dev, batch_size=args.batch_size, device=args.gpu, train=False, repeat=False,
+                         sort=False,    shuffle=False)
+test_iter = data.Iterator(test, batch_size=args.batch_size, device=args.gpu, train=False, repeat=False,
+                          sort=False, shuffle=False)
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dev_per_epoch", default=9, type=int)
-    parser.add_argument("--fc_size", default=200, type=int)
-    parser.add_argument("--gpu_number", default=0, type=int)
-    parser.add_argument("--hidden_size", default=200, type=int)
-    parser.add_argument("--input_file", default="saves/model.pt", type=str)
-    parser.add_argument("--lr", default=1E-1, type=float)
-    parser.add_argument("--mbatch_size", default=64, type=int)
-    parser.add_argument("--n_epochs", default=30, type=int)
-    parser.add_argument("--n_feature_maps", default=200, type=float)
-    parser.add_argument("--n_labels", default=5, type=int)
-    parser.add_argument("--no_cuda", action="store_true", default=False)
-    parser.add_argument("--output_file", default="saves/model.pt", type=str)
-    parser.add_argument("--random_search", action="store_true", default=False)
-    parser.add_argument("--restore", action="store_true", default=False)
-    parser.add_argument("--rnn_type", choices=["lstm", "gru"], default="lstm", type=str)
-    parser.add_argument("--seed", default=3, type=int)
-    parser.add_argument("--quiet", action="store_true", default=False)
-    parser.add_argument("--weight_decay", default=1E-4, type=float)
-    args = parser.parse_args()
-    if args.random_search:
-        do_random_search(vars(args))
-        return
-    train(**vars(args))
+config.target_class = len(LABEL.vocab)
+config.questions_num = len(QUESTION.vocab)
+config.answers_num = len(ANSWER.vocab)
 
-if __name__ == "__main__":
-    main()
+print("Dataset {}    Mode {}".format(args.dataset, args.mode))
+print("VOCAB num", len(QUESTION.vocab))
+print("LABEL.target_class:", len(LABEL.vocab))
+print("LABELS:", LABEL.vocab.itos)
+print("Train instance", len(train))
+print("Dev instance", len(dev))
+print("Test instance", len(test))
 
+if args.resume_snapshot:
+    if args.cuda:
+        pw_model = torch.load(args.resume_snapshot, map_location=lambda storage, location: storage.cuda(args.gpu))
+    else:
+        pw_model = torch.load(args.resume_snapshot, map_location=lambda storage, location: storage)
+else:
+    model = SmConvRNN(config)
+    model.static_question_embed.weight.data.copy_(QUESTION.vocab.vectors)
+    model.nonstatic_question_embed.weight.data.copy_(QUESTION.vocab.vectors)
+    model.static_answer_embed.weight.data.copy_(ANSWER.vocab.vectors)
+    model.nonstatic_answer_embed.weight.data.copy_(ANSWER.vocab.vectors)
+
+    if args.cuda:
+        model.cuda()
+        print("Shift model to GPU")
+
+
+parameter = filter(lambda p: p.requires_grad, model.parameters())
+
+# the SM model originally follows SGD but Adadelta is used here
+optimizer = torch.optim.Adadelta(parameter, lr=args.lr, weight_decay=args.weight_decay, eps=1e-6)
+# A good lr is required to use Adam
+# optimizer = torch.optim.Adam(parameter, lr=args.lr, weight_decay=args.weight_decay, eps=1e-8)
+
+# criterion = nn.CrossEntropyLoss(weight=torch.cuda.FloatTensor([0,0.2,0.8]))
+criterion = nn.CrossEntropyLoss()
+# marginRankingLoss = nn.MarginRankingLoss(margin = 1, size_average = True)
+
+
+
+early_stop = False
+iterations = 0
+iters_not_improved = 0
+epoch = 0
+q2neg = {} # a dict from qid to a list of aid
+question2answer = {} # a dict from qid to the information of both pos and neg answers
+best_dev_map = 0
+best_dev_mrr = 0
+false_samples = {}
+
+start = time.time()
+header = '  Time Epoch Iteration Progress    (%Epoch)   Loss   Dev/Loss     Accuracy  Dev/Accuracy'
+dev_log_template = ' '.join('{:>6.0f},{:>5.0f},{:>9.0f},{:>5.0f}/{:<5.0f} {:>7.0f}%,{:>8.6f},{:8.6f},{:12.4f},{:12.4f}'.split(','))
+log_template = ' '.join('{:>6.0f},{:>5.0f},{:>9.0f},{:>5.0f}/{:<5.0f} {:>7.0f}%,{:>8.6f},{},{:12.4f},{}'.split(','))
+os.makedirs(args.save_path, exist_ok=True)
+os.makedirs(os.path.join(args.save_path, args.dataset), exist_ok=True)
+print(header)
+
+index2label = np.array(LABEL.vocab.itos) # ['<unk>', '0', '1']
+index2qid = np.array(QID.vocab.itos) # torchtext index to qid in the TrecQA dataset
+index2aid = np.array(AID.vocab.itos) # torchtext index to aid in the TrecQA dataset
+index2question = np.array(QUESTION.vocab.itos)  # torchtext index to words appearing in questions in the TrecQA dataset
+index2answer = np.array(ANSWER.vocab.itos) # torchtext index to words appearing in answers in the TrecQA dataset
+
+
+# Questions, answers and ext_features for each qid
+qid_correct_ans_dict = {}
+qid_questions_dict = {}
+qid_anwers_dict = {}
+qid_ext_feat_dict = {}
+qid_label_dict = {}
+
+
+# pack the lists of question/answer/ext_feat into a torchtext batch
+def get_qid_batch(qid, qid_questions_dict, qid_anwers_dict, qid_ext_feat_dict, qid_label_dict):
+    new_batch = data.Batch()
+    question = qid_questions_dict[qid]
+    answers = qid_anwers_dict[qid]
+    labels = qid_label_dict[qid]
+    ext_feats = qid_ext_feat_dict[qid]
+
+
+
+    size = len(qid_anwers_dict[qid])
+    new_batch.batch_size = size
+    new_batch.dataset = "trecqa"
+
+    
+    max_len_a = max([ans.size()[0] for ans in answers])
+
+    padding_answers = []
+
+    for ans in answers:
+        padding_answers.append(F.pad(ans,(0, max_len_a - ans.size()[0]), value=1))
+
+    setattr(new_batch, "answer", torch.stack(padding_answers))
+    setattr(new_batch, "question", torch.stack(question.repeat(size,1)))
+    setattr(new_batch, "ext_feat", torch.stack(ext_feats))
+    setattr(new_batch, "label", torch.stack(labels))
+    return new_batch
+
+
+
+while True:
+    if early_stop:
+        print("Early Stopping. Epoch: {}, Best Dev Acc: {}".format(epoch, best_dev_map))
+        break
+    epoch += 1
+    train_iter.init_epoch()
+    n_correct, n_total = 0, 0
+
+    for batch_idx, batch in enumerate(train_iter):
+        iterations += 1
+        model.train(); optimizer.zero_grad()
+        scores = model(batch)
+        n_correct += (torch.max(scores, 1)[1].view(batch.label.size()).data == batch.label.data).sum()
+        n_total += batch.batch_size
+        train_acc = 100. * n_correct / n_total
+
+        loss = criterion(scores, batch.label)
+        loss.backward()
+        optimizer.step()
+
+        # Evaluate performance on validation set
+        if iterations % args.dev_every == 1:
+            # switch model into evaluation mode
+            model.eval()
+            dev_iter.init_epoch()
+            n_dev_correct = 0
+            dev_losses = []
+            instance = []
+            for dev_batch_idx, dev_batch in enumerate(dev_iter):
+                qid_array = index2qid[np.transpose(dev_batch.qid.cpu().data.numpy())]
+                true_label_array = index2label[np.transpose(dev_batch.label.cpu().data.numpy())]
+
+                scores = model(dev_batch)
+                n_dev_correct += (torch.max(scores, 1)[1].view(dev_batch.label.size()).data == dev_batch.label.data).sum()
+                dev_loss = criterion(scores, dev_batch.label)
+                dev_losses.append(dev_loss.data[0])
+                index_label = np.transpose(torch.max(scores, 1)[1].view(dev_batch.label.size()).cpu().data.numpy())
+                label_array = index2label[index_label]
+                # get the relevance scores
+                score_array = scores[:, 2].cpu().data.numpy()
+                for i in range(dev_batch.batch_size):
+                    this_qid, predicted_label, score, gold_label = qid_array[i], label_array[i], score_array[i], true_label_array[i]
+                    instance.append((this_qid, predicted_label, score, gold_label))
+
+
+            dev_map, dev_mrr = evaluate(instance, config.dataset, 'valid', config.mode)
+            print(dev_log_template.format(time.time() - start,
+                                          epoch, iterations, 1 + batch_idx, len(train_iter),
+                                          100. * (1 + batch_idx) / len(train_iter), loss.data[0],
+                                          sum(dev_losses) / len(dev_losses), train_acc, dev_map))
+
+            # Update validation results
+            if dev_map > best_dev_map:
+                iters_not_improved = 0
+                best_dev_map = dev_map
+                snapshot_path = os.path.join(args.save_path, args.dataset, args.mode+'_best_model.pt')
+                torch.save(model, snapshot_path)
+            else:
+                iters_not_improved += 1
+                if iters_not_improved >= args.patience:
+                    early_stop = True
+                    break
+
+        # if iterations % args.log_every == 1:
+        #     # print progress message
+        #     print(log_template.format(time.time() - start,
+        #                               epoch, iterations, 1 + batch_idx, len(train_iter),
+        #                               100. * (1 + batch_idx) / len(train_iter), loss.data[0], ' ' * 8,
+        #                               n_correct / n_total * 100, ' ' * 12))
+
+      

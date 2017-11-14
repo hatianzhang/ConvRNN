@@ -17,7 +17,11 @@ You may then run `python train.py` and `python test.py` for training and testing
 ### Empirical results
 Best dev | Test
 -- | --
-52.04359673024523 | 50.85972850678733
+```
+python train.py --mode static --gpu 2 --vector_cache /data/word2vec.trecqa.pt
+```
+0.8204 0.8801
+0.7791 0.8422
 
 ### References
 [1] Chenglong Wang, Feijun Jiang, and Hongxia Yang. 2017. A Hybrid Framework for Text Modeling with Convolutional RNN. In Proceedings of the 23rd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining (KDD '17).
